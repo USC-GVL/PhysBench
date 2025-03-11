@@ -35,7 +35,7 @@ Furthermore, we demonstrate that improving VLMs’ understanding of the physical
 ![Alt text](assets/data_cases_full.png)
 ## Dataset Summary
 
-The complete **PhysBench-test** dataset consists of of 10,002 entries, which are more challenging and diverse, as the test set, and 200 entries as the validation set for parameter choosing.
+The complete **PhysBench-test** dataset consists of 10,002 entries, which are more challenging and diverse, as the test set, and 200 entries as the validation set for parameter choosing.
 
 <img src="assets/stat.png" width="900" />
 
