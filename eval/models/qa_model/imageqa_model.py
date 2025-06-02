@@ -972,6 +972,178 @@ class InternVLChat(QAModelInstance):
 		cprint(response, 'cyan')
 		return response
 
+class InternVLChat2(QAModelInstance):
+	# zw@usc: 2025.06.01 update
+	# This is the code of internvl2, which is based on the implementation in huggingface (https://huggingface.co/OpenGVLab/InternVL2-1B).
+	# This class encapsulation is relatively bare, 
+	# so it is recommended to refer to the implementation of lmdeploy https://github.com/InternLM/lmdeploy
+	def __init__(self, ckpt="OpenGVLab/InternVL2-1B", torch_device=torch.device("cuda"), model_precision=torch.float32):
+		from transformers import AutoTokenizer, AutoModel
+		if '26B' in ckpt or '40B' in ckpt or '76B' in ckpt:  # multi-GPU mode
+			if '2_5' not in ckpt:
+				if '26' in ckpt:
+					name = 'InternVL2-26B'
+				elif '40B' in ckpt:
+					name = 'InternVL2-40B'
+				else:
+					name = 'InternVL2-Llama3-76B'
+			else:
+				if '26' in ckpt:
+					name = 'InternVL2_5-26B'
+				elif '38B' in ckpt:
+					name = 'InternVL2_5-38B'
+				else:
+					name = 'InternVL2_5-78B'
+			device_map = self._split_model(name) # ex: 'InternVL2-1B'
+			self.model = AutoModel.from_pretrained(
+				ckpt,
+				torch_dtype=torch.bfloat16,
+				load_in_8bit=True,
+				low_cpu_mem_usage=True,
+				use_flash_attn=True,
+				trust_remote_code=True,
+				device_map=device_map
+			).eval()
+		else:
+			self.model = AutoModel.from_pretrained(
+				ckpt,
+				torch_dtype=torch.bfloat16,
+				low_cpu_mem_usage=True,
+				use_flash_attn=True,
+				trust_remote_code=True).eval().cuda()
+
+		self.tokenizer = AutoTokenizer.from_pretrained(ckpt, trust_remote_code=True, use_fast=False)
+		self.num_frames = test_frame
+
+	def _build_transform(self, input_size):
+		MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+		transform = T.Compose([
+			T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+			T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+			T.ToTensor(),
+			T.Normalize(mean=MEAN, std=STD)
+		])
+		return transform
+
+	def _find_closest_aspect_ratio(self, aspect_ratio, target_ratios, width, height, image_size):
+		best_ratio_diff = float('inf')
+		best_ratio = (1, 1)
+		area = width * height
+		for ratio in target_ratios:
+			target_aspect_ratio = ratio[0] / ratio[1]
+			ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+			if ratio_diff < best_ratio_diff:
+				best_ratio_diff = ratio_diff
+				best_ratio = ratio
+			elif ratio_diff == best_ratio_diff:
+				if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+					best_ratio = ratio
+		return best_ratio
+
+	def _dynamic_preprocess(self, image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+		orig_width, orig_height = image.size
+		aspect_ratio = orig_width / orig_height
+
+		# calculate the existing image aspect ratio
+		target_ratios = set(
+			(i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+			i * j <= max_num and i * j >= min_num)
+		target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+		# find the closest aspect ratio to the target
+		target_aspect_ratio = find_closest_aspect_ratio(
+			aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+		# calculate the target width and height
+		target_width = image_size * target_aspect_ratio[0]
+		target_height = image_size * target_aspect_ratio[1]
+		blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+		# resize the image
+		resized_img = image.resize((target_width, target_height))
+		processed_images = []
+		for i in range(blocks):
+			box = (
+				(i % (target_width // image_size)) * image_size,
+				(i // (target_width // image_size)) * image_size,
+				((i % (target_width // image_size)) + 1) * image_size,
+				((i // (target_width // image_size)) + 1) * image_size
+			)
+			# split the image
+			split_img = resized_img.crop(box)
+			processed_images.append(split_img)
+		assert len(processed_images) == blocks
+		if use_thumbnail and len(processed_images) != 1:
+			thumbnail_img = image.resize((image_size, image_size))
+			processed_images.append(thumbnail_img)
+		return processed_images
+
+	def _load_image(self, image_file, input_size=448, max_num=12):
+		image = Image.open(image_file).convert('RGB')
+		transform = build_transform(input_size=input_size)
+		images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+		pixel_values = [transform(image) for image in images]
+		pixel_values = torch.stack(pixel_values)
+		return pixel_values
+	def _split_model(self, model_name):
+		device_map = {}
+		world_size = torch.cuda.device_count()
+		num_layers = {
+			'InternVL2-1B': 24, 'InternVL2-2B': 24, 'InternVL2-4B': 32, 'InternVL2-8B': 32,
+			'InternVL2-26B': 48, 'InternVL2-40B': 60, 'InternVL2-Llama3-76B': 80,
+			'InternVL2_5-1B': 24, 'InternVL_5-2B': 24, 'InternVL2_5-4B': 36, 'InternVL2_5-8B': 32,
+			'InternVL2_5-26B': 48, 'InternVL2_5-38B': 64, 'InternVL2_5-78B': 80
+		}[model_name]
+		# Since the first GPU will be used for ViT, treat it as half a GPU.
+		num_layers_per_gpu = math.ceil(num_layers / (world_size - 0.5))
+		num_layers_per_gpu = [num_layers_per_gpu] * world_size
+		num_layers_per_gpu[0] = math.ceil(num_layers_per_gpu[0] * 0.5)
+		layer_cnt = 0
+		for i, num_layer in enumerate(num_layers_per_gpu):
+			for j in range(num_layer):
+				device_map[f'language_model.model.layers.{layer_cnt}'] = i
+				layer_cnt += 1
+		device_map['vision_model'] = 0
+		device_map['mlp1'] = 0
+		device_map['language_model.model.tok_embeddings'] = 0
+		device_map['language_model.model.embed_tokens'] = 0
+		device_map['language_model.output'] = 0
+		device_map['language_model.model.norm'] = 0
+		device_map['language_model.lm_head'] = 0
+		device_map[f'language_model.model.layers.{num_layers - 1}'] = 0
+		print(device_map)
+		return device_map
+
+	def qa(self, image, prompt, mode):
+		image_list = []
+		video_token_num = 0
+		for it in image:
+			if it.endswith(".mp4"):
+				ori = len(image_list)
+				image_list += opencv_extract_frames_o(it, frames=self.num_frames)
+				video_token_num = len(image_list) - ori
+			else:
+				image_list.append(Image.open(it).convert('RGB'))
+
+		pixel_values_list = []
+		num_patches_list = []
+		for img in image_list:
+			with tempfile.NamedTemporaryFile(delete=True, suffix=".png") as tmp:
+				img.save(tmp.name)
+				image_path = tmp.name
+				pv = self._load_image(image_path, max_num=12).to(torch.bfloat16).cuda()
+				pixel_values_list.append(pv)
+				num_patches_list.append(pv.size(0))
+		pixel_values = torch.cat(pixel_values_list, dim=0)
+
+		prompt = prompt.replace("<video>", "<image>" * video_token_num)
+		response, history = self.model.chat(self.tokenizer, pixel_values, prompt,
+									   dict(max_new_tokens=10, do_sample=False),
+									   num_patches_list=num_patches_list,
+									   history=None, return_history=True)
+		print('response')
+		cprint(response, 'cyan')
+		return response
 
 class GPT4V(QAModelInstance):
 	model_stamp = 'gpt-4-turbo'
